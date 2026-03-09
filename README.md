@@ -113,14 +113,12 @@ Reference `.env.example`. Key variables:
 
 ## Polling Strategy
 
-Tiered scheduling:
+Unified scheduling:
 
-- DM / MPIM: every 30s
-- Active channels (activity within 2h): every 60s
-- Inactive channels: every 10min
+- All visible conversations: one incremental sweep every 5 minutes
 - Conversation list refresh: every 10min
 
-Rate limits: soft 12 req/min, hard 20 req/min. Respects Slack `429 Retry-After`. Auto-degrades on sustained rate limiting.
+Rate limits: soft 12 req/min, hard 20 req/min. The relay proactively spaces API calls to stay near the soft limit and still respects Slack `429 Retry-After`.
 
 ## Monitoring
 
