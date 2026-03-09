@@ -1,0 +1,10 @@
+services:
+  relay:
+    build: .
+    image: china-notify-relay:latest
+    env_file: .env
+    ports:
+      - "${HEALTH_PORT:-8080}:8080"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
