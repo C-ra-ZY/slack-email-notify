@@ -8,6 +8,7 @@ import { WebClient } from "@slack/web-api";
  * Rate limits (§5.3):
  *  - Soft limit: 12 req/min — normal operating range
  *  - Hard limit: 20 req/min — absolute max before forced wait
+ *  - Proactively pace requests to stay near the soft limit
  *  - On 429: respect Retry-After exactly
  *  - On consecutive 429s: auto-degrade polling frequency
  */
@@ -16,6 +17,7 @@ const SOFT_LIMIT = 12; // requests per minute
 const HARD_LIMIT = 20; // absolute cap per minute
 const WINDOW_MS = 60_000; // 1-minute sliding window
 const DEFAULT_RETRY_AFTER_S = 30;
+const SOFT_LIMIT_SPACING_MS = Math.ceil(WINDOW_MS / SOFT_LIMIT);
 
 export interface RateControllerStats {
   requestsInWindow: number;
@@ -27,6 +29,7 @@ export interface RateControllerStats {
 export class SlackClient {
   readonly web: WebClient;
   private readonly requestTimestamps: number[] = [];
+  private requestQueue: Promise<void> = Promise.resolve();
   private rateLimitedUntil = 0;
   private _consecutiveRateLimits = 0;
 
@@ -50,42 +53,57 @@ export class SlackClient {
   /**
    * Execute a Slack API call through the rate controller.
    *
+   * - Serializes all Slack API calls through one queue
+   * - Paces requests to stay around the soft limit
    * - Waits if we're in a Retry-After window
    * - Waits if we'd exceed hard limit
    * - Tracks request timestamps for soft/hard limit enforcement
    * - Handles 429 responses by reading Retry-After
    */
   async call<T>(fn: (client: WebClient) => Promise<T>): Promise<T> {
-    // Wait if we're in a 429 Retry-After cooldown
-    await this.waitForRetryAfter();
+    const run = async (): Promise<T> => {
+      for (;;) {
+        // Wait if we're in a 429 Retry-After cooldown
+        await this.waitForRetryAfter();
 
-    // Wait if we'd exceed the hard limit
-    await this.waitForHardLimit();
+        // Proactively pace requests near the soft limit
+        await this.waitForSoftPacing();
 
-    // Record this request
-    this.requestTimestamps.push(Date.now());
+        // Wait if we'd exceed the hard limit
+        await this.waitForHardLimit();
 
-    try {
-      const result = await fn(this.web);
-      this._consecutiveRateLimits = 0;
-      return result;
-    } catch (err: unknown) {
-      if (isRateLimitError(err)) {
-        const retryAfter = getRateLimitDelay(err);
-        this.rateLimitedUntil = Date.now() + retryAfter * 1000;
-        this._consecutiveRateLimits++;
+        // Record this request
+        this.requestTimestamps.push(Date.now());
 
-        console.warn(
-          `[slack-client] Rate limited (429). Retry-After: ${retryAfter}s. ` +
-            `Consecutive: ${this._consecutiveRateLimits}`,
-        );
+        try {
+          const result = await fn(this.web);
+          this._consecutiveRateLimits = 0;
+          return result;
+        } catch (err: unknown) {
+          if (isRateLimitError(err)) {
+            const retryAfter = getRateLimitDelay(err);
+            this.rateLimitedUntil = Date.now() + retryAfter * 1000;
+            this._consecutiveRateLimits++;
 
-        // Wait then retry through our own rate controller (not raw fn)
-        await sleep(retryAfter * 1000);
-        return this.call(fn);
+            console.warn(
+              `[slack-client] Rate limited (429). Retry-After: ${retryAfter}s. ` +
+                `Consecutive: ${this._consecutiveRateLimits}`,
+            );
+
+            await sleep(retryAfter * 1000);
+            continue;
+          }
+          throw err;
+        }
       }
-      throw err;
-    }
+    };
+
+    const queued = this.requestQueue.then(run, run);
+    this.requestQueue = queued.then(
+      () => undefined,
+      () => undefined,
+    );
+    return queued;
   }
 
   // -------------------------------------------------------------------------
@@ -120,6 +138,21 @@ export class SlackClient {
       const waitMs = this.rateLimitedUntil - now;
       console.log(
         `[slack-client] Waiting ${Math.ceil(waitMs / 1000)}s for Retry-After cooldown`,
+      );
+      await sleep(waitMs);
+    }
+  }
+
+  private async waitForSoftPacing(): Promise<void> {
+    this.pruneOldTimestamps();
+
+    const latest = this.requestTimestamps[this.requestTimestamps.length - 1];
+    if (latest === undefined) return;
+
+    const waitMs = latest + SOFT_LIMIT_SPACING_MS - Date.now();
+    if (waitMs > 0) {
+      console.log(
+        `[slack-client] Soft pacing active (${SOFT_LIMIT}/min target). Waiting ${Math.ceil(waitMs / 1000)}s`,
       );
       await sleep(waitMs);
     }

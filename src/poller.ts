@@ -22,30 +22,22 @@ export interface SlackMessage {
 }
 
 // ---------------------------------------------------------------------------
-// Poller (§4.3, §5.2 — Tiered polling with User-Token-First correctness)
+// Poller (§4.3, §5.2 — Unified polling with User-Token-First correctness)
 // ---------------------------------------------------------------------------
 
 /**
- * §5.2 Tiered polling schedule:
- *  - DM / MPIM: every 30s
- *  - Active channels (activity in last 2h): every 60s
- *  - Inactive channels: every 10min
+ * §5.2 Unified polling schedule:
+ *  - All visible conversations are polled in one sweep every 5 minutes
+ *  - No per-type loops for DM / channel / active / inactive
  *
  * §5.3 Rate control:
- *  - Handled by SlackClient's rate controller (12/20 req/min)
- *  - On consecutive rate limits, auto-degrade to longer intervals
+ *  - Handled by SlackClient's shared rate controller (12/20 req/min)
+ *  - Requests are proactively paced to stay near the soft limit
  */
 
-const POLL_INTERVAL_DM_MS = 30_000; // §5.2: DM/MPIM every 30s
-const POLL_INTERVAL_ACTIVE_MS = 60_000; // §5.2: Active channels every 60s
-const POLL_INTERVAL_INACTIVE_MS = 10 * 60_000; // §5.2: Inactive every 10min
-
-const ACTIVE_WINDOW_MS = 2 * 60 * 60 * 1000; // 2 hours = "active"
+const POLL_INTERVAL_MS = 5 * 60_000; // 5 minutes
 const HISTORY_LIMIT = 100; // §5.4: conservative per-request limit
-const TICK_INTERVAL_MS = 5_000; // Check every 5s which conversations are due
-
-/** Multiplier applied when rate-limited to back off polling */
-const RATE_LIMIT_DEGRADATION = 3;
+const MIN_NEXT_SWEEP_DELAY_MS = 1_000;
 
 export class Poller {
   private readonly slack: SlackClient;
@@ -54,19 +46,13 @@ export class Poller {
 
   private teamId = "";
   private running = false;
-  private tickTimer: ReturnType<typeof setInterval> | null = null;
+  private sweepTimer: ReturnType<typeof setTimeout> | null = null;
 
-  /** Mutex to prevent concurrent pollDueConversations runs (Fix 8a) */
+  /** Mutex to prevent overlapping sweep runs */
   private polling = false;
 
-  /** Per-channel lock to prevent concurrent polling of the same conversation (Review P1 #1) */
+  /** Per-channel lock to prevent concurrent polling of the same conversation */
   private channelLocks = new Set<string>();
-
-  /** Track when each conversation was last polled */
-  private lastPolledAt = new Map<string, number>();
-
-  /** Track which conversations recently had new messages (for tiered scheduling) */
-  private lastActivityAt = new Map<string, number>();
 
   /** Callback when new messages are discovered */
   onMessages: ((messages: SlackMessage[]) => Promise<string | null>) | null = null;
@@ -89,64 +75,41 @@ export class Poller {
   // -------------------------------------------------------------------------
 
   /**
-   * Start the poller. Authenticates, discovers conversations, then begins polling.
-   * Returns metadata (selfUserId) after auth + discovery but BEFORE first poll round,
-   * so callers can mark health as connected early (Fix 4).
+   * Start the poller. Authenticates, discovers conversations, then begins the
+   * unified polling loop. Returns metadata (selfUserId) after auth + discovery
+   * but before the first sweep completes, so callers can mark health early.
    */
   async start(): Promise<{ selfUserId: string }> {
     this.running = true;
 
-    // Authenticate and get team ID + user ID
     const auth = await this.slack.call((c) => c.auth.test());
     if (!auth.ok || !auth.team_id || !auth.user_id) {
       throw new Error("Slack auth.test failed — check SLACK_USER_TOKEN");
     }
     this.teamId = auth.team_id;
     const selfUserId = auth.user_id;
-    console.log(`[poller] Authenticated as user ${selfUserId} in team ${this.teamId}`);
+    console.log(
+      `[poller] Authenticated as user ${selfUserId} in team ${this.teamId}`,
+    );
 
-    // Discover conversations
     await this.discovery.refresh();
     this.discovery.startPeriodicRefresh();
 
-    // Initialize lastActivityAt from conversation metadata
-    for (const conv of this.discovery.getConversations()) {
-      if (conv.lastActivityTs) {
-        const tsNum = parseFloat(conv.lastActivityTs);
-        if (!isNaN(tsNum)) {
-          // Slack epoch timestamps can be seconds or already in milliseconds
-          const ms = tsNum > 1e12 ? tsNum : tsNum * 1000;
-          this.lastActivityAt.set(conv.id, ms);
-        }
-      }
-    }
-
-    // Do one immediate full poll round (non-blocking for health status)
-    void this.pollDueConversations(true).catch((err) => {
+    void this.runSweepLoop(true).catch((err) => {
       console.error(
-        "[poller] Initial poll round error:",
+        "[poller] Initial sweep error:",
         err instanceof Error ? err.message : err,
       );
     });
-
-    // Start the tick-based scheduler
-    this.tickTimer = setInterval(() => {
-      void this.pollDueConversations(false).catch((err) => {
-        console.error(
-          "[poller] Tick error:",
-          err instanceof Error ? err.message : err,
-        );
-      });
-    }, TICK_INTERVAL_MS);
 
     return { selfUserId };
   }
 
   stop(): void {
     this.running = false;
-    if (this.tickTimer) {
-      clearInterval(this.tickTimer);
-      this.tickTimer = null;
+    if (this.sweepTimer) {
+      clearTimeout(this.sweepTimer);
+      this.sweepTimer = null;
     }
     this.discovery.stop();
   }
@@ -156,14 +119,11 @@ export class Poller {
    * Used by Socket Mode acceleration to reduce latency.
    */
   async syncConversation(channelId: string): Promise<void> {
-    // Review P1 #1: Acquire per-channel lock to prevent concurrent
-    // polling of the same conversation from tick-based scheduler.
     if (this.channelLocks.has(channelId)) return;
 
     const conversations = this.discovery.getConversations();
     const conv = conversations.find((c) => c.id === channelId);
     if (!conv) {
-      // Might be a new conversation not yet discovered — force refresh
       await this.discovery.refresh();
       const refreshed = this.discovery
         .getConversations()
@@ -173,65 +133,61 @@ export class Poller {
       }
       return;
     }
+
     await this.pollConversation(conv);
   }
 
   // -------------------------------------------------------------------------
-  // Tick-based tiered scheduler
+  // Unified sweep scheduler
   // -------------------------------------------------------------------------
 
-  private async pollDueConversations(forceAll: boolean): Promise<void> {
+  private async runSweepLoop(forceAll: boolean): Promise<void> {
+    const startedAt = Date.now();
+
+    try {
+      await this.pollAllConversations(forceAll);
+    } catch (err) {
+      console.error(
+        "[poller] Sweep error:",
+        err instanceof Error ? err.message : err,
+      );
+    } finally {
+      if (!this.running) return;
+
+      const elapsed = Date.now() - startedAt;
+      const delay = Math.max(MIN_NEXT_SWEEP_DELAY_MS, POLL_INTERVAL_MS - elapsed);
+      this.sweepTimer = setTimeout(() => {
+        void this.runSweepLoop(false);
+      }, delay);
+    }
+  }
+
+  private async pollAllConversations(forceAll: boolean): Promise<void> {
     if (!this.running) return;
 
-    // Fix 8a: Prevent concurrent poll rounds. If a previous round
-    // (e.g. forceAll bootstrap) is still running, skip this tick.
-    if (this.polling) return;
+    if (this.polling) {
+      console.warn("[poller] Sweep still running — skipping overlapping trigger");
+      return;
+    }
     this.polling = true;
 
     try {
       const conversations = this.discovery.getConversations();
-      const now = Date.now();
-      const degraded = this.slack.consecutiveRateLimits > 0;
-      const degradationMultiplier = degraded ? RATE_LIMIT_DEGRADATION : 1;
+      console.log(
+        `[poller] Starting ${forceAll ? "bootstrap " : ""}sweep across ${conversations.length} conversations`,
+      );
 
       for (const conv of conversations) {
         if (!this.running) break;
-
-        // Check if we're soft-limited — if so, skip non-DM conversations
-        if (this.slack.isSoftLimited() && conv.type !== "im" && conv.type !== "mpim") {
-          continue;
-        }
-
-        const interval = this.getInterval(conv) * degradationMultiplier;
-        const lastPolled = this.lastPolledAt.get(conv.id) ?? 0;
-
-        if (forceAll || now - lastPolled >= interval) {
-          await this.pollConversation(conv);
-        }
+        await this.pollConversation(conv);
       }
 
-      // Persist state after each poll round (§6.3)
       this.stateStore.recordPollCompleted();
       this.stateStore.persist();
+      console.log("[poller] Sweep completed");
     } finally {
       this.polling = false;
     }
-  }
-
-  private getInterval(conv: ConversationInfo): number {
-    // §5.2: DM / MPIM → 30s
-    if (conv.type === "im" || conv.type === "mpim") {
-      return POLL_INTERVAL_DM_MS;
-    }
-
-    // §5.2: Active channels (activity in last 2h) → 60s
-    const lastActivity = this.lastActivityAt.get(conv.id) ?? 0;
-    if (Date.now() - lastActivity < ACTIVE_WINDOW_MS) {
-      return POLL_INTERVAL_ACTIVE_MS;
-    }
-
-    // §5.2: Inactive channels → 10min
-    return POLL_INTERVAL_INACTIVE_MS;
   }
 
   // -------------------------------------------------------------------------
@@ -260,7 +216,6 @@ export class Poller {
           `[poller] Bootstrap ${conv.id}: cursor set to ${latestTs}`,
         );
       } else {
-        // Empty conversation — set a sentinel cursor so we don't re-bootstrap
         this.stateStore.setCursor(conv.id, "0");
         console.log(
           `[poller] Bootstrap ${conv.id}: empty conversation, cursor set to 0`,
@@ -268,15 +223,11 @@ export class Poller {
       }
     } catch (err: unknown) {
       if (isTokenInvalidError(err)) {
-        console.error(
-          "[poller] SLACK_USER_TOKEN appears invalid or revoked",
-        );
+        console.error("[poller] SLACK_USER_TOKEN appears invalid or revoked");
         this.onTokenInvalid?.();
         return;
       }
 
-      // Fix 8b: Permanent errors (channel_not_found, etc.) — set sentinel
-      // cursor so we don't retry this conversation every tick.
       if (isPermanentConversationError(err)) {
         this.stateStore.setCursor(conv.id, "0");
         console.warn(
@@ -290,21 +241,16 @@ export class Poller {
         `[poller] Bootstrap failed for ${conv.id}:`,
         err instanceof Error ? err.message : err,
       );
-      // Don't set cursor — will retry next tick
     }
-
-    this.lastPolledAt.set(conv.id, Date.now());
   }
+
   private async pollConversation(conv: ConversationInfo): Promise<void> {
-    // Review P1 #1: Per-channel lock — only one poll at a time per conversation
     if (this.channelLocks.has(conv.id)) return;
     this.channelLocks.add(conv.id);
 
     try {
       const oldest = this.stateStore.getCursor(conv.id);
 
-      // §6.2: First-time bootstrap — no cursor means no prior history.
-      // Fetch limit=1 to get the latest ts, set as cursor, don't process.
       if (oldest === undefined) {
         await this.bootstrapConversation(conv);
         return;
@@ -314,7 +260,6 @@ export class Poller {
       try {
         let cursor: string | undefined;
 
-        // §5.4: Paginate until the full increment window is consumed
         do {
           const result = await this.slack.call((client) => {
             const args: Record<string, unknown> = {
@@ -325,14 +270,11 @@ export class Poller {
             if (oldest && !cursor) args.oldest = oldest;
             if (cursor) args.cursor = cursor;
             return client.conversations.history(
-              args as unknown as Parameters<
-                typeof client.conversations.history
-              >[0],
+              args as unknown as Parameters<typeof client.conversations.history>[0],
             );
           });
 
           if (result.messages && result.messages.length > 0) {
-            // Messages come newest-first; collect all then reverse
             for (const msg of result.messages) {
               if (!msg.ts) continue;
 
@@ -359,21 +301,17 @@ export class Poller {
         } while (cursor);
       } catch (err: unknown) {
         if (isTokenInvalidError(err)) {
-          console.error(
-            "[poller] SLACK_USER_TOKEN appears invalid or revoked",
-          );
+          console.error("[poller] SLACK_USER_TOKEN appears invalid or revoked");
           this.onTokenInvalid?.();
           return;
         }
 
-        // Fix 8b: Permanent errors in regular poll path too
         if (isPermanentConversationError(err)) {
           console.warn(
-            `[poller] Conversation ${conv.id} permanently inaccessible, suppressing retries:`,
+            `[poller] Conversation ${conv.id} permanently inaccessible, marking as skipped:`,
             err instanceof Error ? err.message : err,
           );
-          // Set lastPolledAt far in the future to stop retrying
-          this.lastPolledAt.set(conv.id, Date.now() + 24 * 60 * 60 * 1000);
+          this.stateStore.setCursor(conv.id, "0");
           return;
         }
 
@@ -384,38 +322,25 @@ export class Poller {
         return;
       }
 
-      this.lastPolledAt.set(conv.id, Date.now());
-
       if (allMessages.length === 0) return;
 
-      // Reverse to chronological order
       allMessages.reverse();
 
-      // Filter: skip already-processed (dedup with Socket Mode)
       const newMessages: SlackMessage[] = [];
       for (const msg of allMessages) {
         if (this.stateStore.isProcessed(conv.id, msg.ts)) continue;
         newMessages.push(msg);
       }
 
-      if (newMessages.length > 0) {
-        // Track activity for tiered scheduling
-        this.lastActivityAt.set(conv.id, Date.now());
+      if (newMessages.length > 0 && this.onMessages) {
+        const lastSuccessTs = await this.onMessages(newMessages);
 
-        if (this.onMessages) {
-          // Callback returns the ts of the last successfully processed message
-          const lastSuccessTs = await this.onMessages(newMessages);
-
-          // Only advance cursor to the last successfully processed message
-          if (lastSuccessTs) {
-            this.stateStore.setCursor(conv.id, lastSuccessTs);
-          }
-          return;
+        if (lastSuccessTs) {
+          this.stateStore.setCursor(conv.id, lastSuccessTs);
         }
+        return;
       }
 
-      // No new messages, but advance cursor to latest fetched ts
-      // so we don't re-fetch the same batch next time
       const latestTs = allMessages[allMessages.length - 1]?.ts;
       if (latestTs) {
         this.stateStore.setCursor(conv.id, latestTs);
@@ -425,6 +350,7 @@ export class Poller {
     }
   }
 }
+
 // ---------------------------------------------------------------------------
 // Error detection helpers
 // ---------------------------------------------------------------------------
@@ -433,7 +359,6 @@ function isTokenInvalidError(err: unknown): boolean {
   if (typeof err !== "object" || err === null) return false;
   const obj = err as Record<string, unknown>;
 
-  // @slack/web-api throws with `data.error` for API errors
   if (obj.code === "slack_webapi_platform_error") {
     const data = obj.data as Record<string, unknown> | undefined;
     if (data) {
@@ -451,10 +376,6 @@ function isTokenInvalidError(err: unknown): boolean {
   return false;
 }
 
-/**
- * Fix 8b: Detect permanent conversation errors that will never succeed.
- * These should not be retried — set a sentinel cursor instead.
- */
 function isPermanentConversationError(err: unknown): boolean {
   if (typeof err !== "object" || err === null) return false;
   const obj = err as Record<string, unknown>;

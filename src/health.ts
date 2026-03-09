@@ -17,10 +17,10 @@ const SMTP_UNHEALTHY_THRESHOLD = 5;
 /** §9.4: Heartbeat interval */
 const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
-/** Review P1 #2: Polling liveness staleness thresholds */
-const POLL_STALE_DEGRADED_MS = 5 * 60 * 1000; // 5 min without poll → degraded
-const POLL_STALE_UNHEALTHY_MS = 15 * 60 * 1000; // 15 min without poll → unhealthy
-const POLL_GRACE_PERIOD_MS = 2 * 60 * 1000; // 2 min grace after startup
+/** Polling liveness staleness thresholds for 5-minute unified sweeps */
+const POLL_STALE_DEGRADED_MS = 15 * 60 * 1000; // 15 min without poll → degraded
+const POLL_STALE_UNHEALTHY_MS = 30 * 60 * 1000; // 30 min without poll → unhealthy
+const POLL_GRACE_PERIOD_MS = 6 * 60 * 1000; // Grace for startup + first sweep
 
 export interface HealthSnapshot {
   status: HealthStatus;
