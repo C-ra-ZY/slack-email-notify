@@ -9,10 +9,13 @@ import { formatSubject, formatBody } from "./email-formatter.js";
 import { NameResolver } from "./name-resolver.js";
 import { HealthMonitor } from "./health.js";
 import { SocketModeAccelerator } from "./socket-mode.js";
+import { installTimestampedConsole } from "./logging.js";
 
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
+
+installTimestampedConsole();
 
 async function main(): Promise<void> {
   console.log("[main] china-notify v2 starting...");
